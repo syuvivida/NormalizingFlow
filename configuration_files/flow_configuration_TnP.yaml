@@ -1,0 +1,19 @@
+# This file holds the configurations train a normalizing flow by the main.py file
+# You can set multiple configurations and the main file will loop trough them and perform diferent trainings
+
+configuration_PostEE_example_condor_v1:
+    n_transforms    : 5
+    aux_nodes       : 256
+    aux_layers      : 2
+    n_splines_bins  : 10
+    initial_lr      : 1.0e-4
+    batch_size      : 2048
+    max_epochs      : 2
+    patience        : 20
+    scheduler_patience : 8
+    DoKinematicsRW  : True
+    IsAutoRegressive: False
+    re_process_data  : True
+
+
+

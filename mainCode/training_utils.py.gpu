@@ -1,0 +1,617 @@
+# python libraries import
+import os 
+import numpy as np
+import glob
+import torch
+import pandas as pd
+import zuko
+import json
+
+# importing other scripts
+import plot_utils  
+
+#early stopping class
+class EarlyStopper:
+    def __init__(self, patience=1, min_delta=0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.min_validation_loss = np.inf
+
+    def early_stop(self, validation_loss):
+        if validation_loss < self.min_validation_loss:
+            self.min_validation_loss = validation_loss
+            self.counter = 0
+        elif validation_loss > (self.min_validation_loss + self.min_delta):
+            self.counter += 1
+            if self.counter >= self.patience:
+                return True
+        return False
+
+# Class that will handle most of the heavy work to perform the corrections!
+# This class should be able to train and evaluate the flow on Z->ee samples
+# But also perform the needed valdiaitons on Z->mumugamma and Diphoton samples 
+class Simulation_correction():
+   
+    def __init__(self, configuration, var_list, conditions_list, indexes_for_iso_transform, Iso_transform_shift, IsAutoRegressive , n_transforms, n_splines_bins, aux_nodes, aux_layers, max_epoch_number, initial_lr, batch_size, patience, scheduler_patience, tensor_path):
+
+        # Name of the variables used as conditions and during training!
+        self.variables_list = var_list
+        self.conditions_list = conditions_list
+        
+        if( IsAutoRegressive ):
+            self.n_passes_flow = 1
+        else:
+            self.n_passes_flow = 2
+
+        # if False, the inputs are not standardized!
+        self.perform_std_transform     = True
+        self.indexes_for_iso_transform = indexes_for_iso_transform
+        self.Iso_transform_shift       = Iso_transform_shift
+        
+        print( 'Standartization: ', self.perform_std_transform )
+
+        # check if mps is available
+        print("Checking device availability...")
+
+        if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+            device = torch.device("mps")
+            print("Using Apple GPU (MPS backend)")
+        
+        elif torch.cuda.is_available():
+            best_device = 0
+            max_free = -1
+            for idx in range(torch.cuda.device_count()):
+                try:
+                    torch.cuda.set_device(idx)
+                    free_mem, _ = torch.cuda.mem_get_info()
+                except RuntimeError:
+                    continue
+                if free_mem > max_free:
+                    max_free = free_mem
+                    best_device = idx
+            torch.cuda.set_device(best_device)
+            device = torch.device(f'cuda:{best_device}')
+            
+            gpu_name = torch.cuda.get_device_name(best_device)
+            total_mem = torch.cuda.get_device_properties(best_device).total_memory
+            
+            print(f'Using GPU cuda:{best_device}')
+            print(f'GPU name: {gpu_name}')
+            print(f'Free memory: {max_free/1e9:.2f} GB')
+            print(f'Total memory: {total_mem/1e9:.2f} GB')
+            print('---------------------------------------\n')
+        
+        else:
+            device = torch.device('cpu')
+        self.device = device
+
+        # Now, lets open a directory to store the results and models of a given configuration
+        self.configuration =  configuration
+        
+        # Lets create a folder with the results
+        try:
+            print('\nThis run dump folder: ', os.getcwd() + '/results/' +self.configuration + '/')
+            # Already creating the folders to store the flow states and the plots
+            os.makedirs(os.getcwd() + '/results/' +self.configuration + '/',  exist_ok=True)
+            os.makedirs(os.getcwd() + '/results/' +self.configuration + '/saved_states/',  exist_ok=True)
+        except:
+            print('\nIt was not possible to open the dump folder')
+            exit()
+
+        # folder to which the code will store the results
+        self.dump_folder = os.getcwd() + '/results/' +self.configuration + '/'
+
+        self.tensor_path = tensor_path
+
+        #reading important tensors
+        self.read_saved_tensor()
+        self.perform_transformation()
+        
+        # defining the flow hyperparametrs as menbers of the class
+        self.n_transforms   = n_transforms
+        self.n_splines_bins = n_splines_bins
+        self.aux_nodes      = aux_nodes
+        self.aux_layers     = aux_layers
+
+        # general training hyperparameters
+        self.max_epoch_number    = max_epoch_number
+        self.initial_lr          = initial_lr
+        self.batch_size          = batch_size
+        self.early_stop_patience = patience
+        self.scheduler_patience  = scheduler_patience
+        
+        ####### defining a config object so the model can be loaded from it
+        self.config = {
+            "model": "NSF",
+            "input_dim":    self.training_inputs.size(1),
+            "context_dim":  self.training_conditions.size(1),
+            "n_splines_bins": self.n_splines_bins,
+            "n_transforms":   self.n_transforms,
+            "hidden_features": [self.aux_nodes] * self.aux_layers,
+            "n_passes_flow":   self.n_passes_flow,
+            "device": str(self.device)
+        }
+
+
+    # performs the training of the normalizing flows
+    def setup_flow(self):
+
+        ### lets save the information as .txt in the dump directory so we know the model configuration
+        with open(self.dump_folder + "model_configuration.txt", "w") as f:
+            json.dump(self.config, f, indent=4)
+
+        # The library we are using is zuko! - passes = 2 for coupling blocks!
+        flow = zuko.flows.NSF(
+            self.training_inputs.size()[1],
+            context=self.training_conditions.size()[1],
+            bins=self.n_splines_bins,
+            transforms=self.n_transforms,
+            hidden_features=[self.aux_nodes] * self.aux_layers,
+            passes=self.n_passes_flow,
+        )
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+        try:
+            flow.to(self.device)
+        except RuntimeError as exc:
+            if (
+                self.device.type == "cuda"
+                and "out of memory" in str(exc).lower()
+            ):
+                raise RuntimeError(
+                    "CUDA out of memory while moving the flow to the GPU. "
+                    "Please ensure the GPU has free memory or reduce the flow size."
+                ) from exc
+            raise
+        self.flow = flow
+
+        self.optimizer = torch.optim.AdamW(self.flow.parameters(), lr= self.initial_lr, weight_decay=1e-5)
+
+        #defining the parameters of the lr scheduler and early stopper!
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer,
+            mode='min',
+            patience=self.scheduler_patience,
+        )
+        
+        self.early_stopper = EarlyStopper(patience=self.early_stop_patience, min_delta=0.01)
+
+        # Two arrays arecreated to keep track of the loss during training
+        self.training_loss_array   = []
+        self.validation_loss_array = [] 
+
+    def train_the_flow(self):
+
+        self.training_dataset    = torch.utils.data.TensorDataset(self.training_inputs , self.training_conditions , self.training_weights)
+        self.training_dataloader = torch.utils.data.DataLoader(self.training_dataset   , batch_size=self.batch_size, shuffle=True   )
+        
+        self.validation_dataset    = torch.utils.data.TensorDataset(self.validation_inputs , self.validation_conditions , self.validation_weights)
+        self.validation_dataloader = torch.utils.data.DataLoader(self.validation_dataset   , batch_size=2048           )
+
+        # This is a hotfix, to make all the tensors and the network have the same dtype
+        self.training_inputs = self.training_inputs.type( dtype = self.training_conditions.dtype )
+        self.flow = self.flow.type(   self.training_inputs.dtype )
+
+        # Normalizing the weights to one
+        #self.training_weights = self.training_weights/torch.sum( self.training_weights )
+
+
+        for epoch in range(999):
+            training_running_loss = 0.0
+            
+            for batch in self.training_dataloader:
+
+                inputs, conditions, weights = batch
+                
+                # to device
+                inputs = inputs.to(self.device)
+                conditions = conditions.to(self.device)
+                weights = weights.to(self.device)
+
+                # Making the graidients zero
+                self.optimizer.zero_grad()
+
+                # Calculating the loss
+                loss = weights * -self.flow(conditions).log_prob(inputs)
+                loss = loss.mean()
+
+                loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(self.flow.parameters(), 1.0)
+
+                self.optimizer.step()
+                training_running_loss = training_running_loss + float(loss)
+                
+            training_running_loss = training_running_loss/len(self.training_dataloader)
+
+            # End of the epoch! - calculating the validation loss and saving nescessary information!
+            saved_states_dir = os.path.join(self.dump_folder, "saved_states")
+            os.makedirs(saved_states_dir, exist_ok=True)
+            checkpoint_path = os.path.join(saved_states_dir, f"epoch_{epoch}.pth")
+            torch.save(self.flow.state_dict(), checkpoint_path)
+            
+            # Switching off the gradients calculation for the validation phase
+            with torch.no_grad():
+
+                # Evaluating the validation loss using mini-batches to save memory
+                total_val_loss = 0.0
+                total_val_events = 0
+                for v_inputs, v_conditions, v_weights in self.validation_dataloader:
+                    v_inputs = v_inputs.to(self.device)
+                    v_conditions = v_conditions.to(self.device)
+                    v_weights = v_weights.to(self.device)
+
+                    batch_val_loss = v_weights * -self.flow(v_conditions).log_prob(v_inputs)
+                    total_val_loss += batch_val_loss.sum().item()
+                    total_val_events += v_inputs.size(0)
+
+                validation_loss = total_val_loss / max(total_val_events, 1)
+                validation_loss_tensor = torch.tensor(validation_loss, device=self.device)
+
+                # saving the losses for further plotting and monitoring!
+                self.training_loss_array.append(   float(training_running_loss) )
+                self.validation_loss_array.append( float(validation_loss) )
+
+                # updating the lr scheduler
+                self.scheduler.step( validation_loss_tensor )
+
+                print( 'Epoch: ', epoch , ' Training loss: ', round(float( training_running_loss ), 4) , ' Validation loss: ', round(float(validation_loss), 4) )
+
+                if( self.early_stopper.early_stop( float( validation_loss ) ) or epoch > self.max_epoch_number ):
+
+                    print( '\n\nBest epoch loss: ', np.min(  np.array( self.validation_loss_array )  ) , ' at epoch: ', np.argmin( np.array( np.array( self.validation_loss_array ) ) ) )
+                    
+                    # Lets select the model with the best validation loss
+                    best_epoch = int(np.argmin(np.array(self.validation_loss_array)))
+                    best_checkpoint = os.path.join(saved_states_dir, f"epoch_{best_epoch}.pth")
+                    self.flow.load_state_dict(torch.load(best_checkpoint))
+                    torch.save(self.flow.state_dict(), self.dump_folder + "/best_model_.pth")
+        
+                    print('\nEnd of model training! Now proceeding to performance evaluation on the test set. This may take a while depending on the size of the test set ... \n')
+
+                    break
+
+        plot_utils.plot_loss_cruve(self.training_loss_array, self.validation_loss_array, self.dump_folder)
+    
+        # call the function that performs the final plots!
+        self.evaluate_results()
+
+    # load the trained model and perform the final plots!
+    def evaluate_results(self):
+        
+        self.mc_test_inputs , self.mc_test_conditions , self.mc_test_weights = self.mc_test_inputs[:2500000] , self.mc_test_conditions[:2500000] , self.mc_test_weights[:2500000]
+        
+        ### defining a test dataset and dataloader
+        self.test_dataset = torch.utils.data.TensorDataset(self.mc_test_inputs , self.mc_test_conditions , self.mc_test_weights)
+        self.test_dataloader = torch.utils.data.DataLoader(self.test_dataset   , batch_size=8128           )
+        
+        MaskOnlyvalidationMC       = self.validation_conditions[:,self.validation_conditions.size()[1] -1 ] == 0
+        self.validation_conditions = self.validation_conditions[MaskOnlyvalidationMC]
+        self.validation_inputs     = self.validation_inputs[MaskOnlyvalidationMC]            
+        self.validation_weights    = self.validation_weights[MaskOnlyvalidationMC]
+        
+        with torch.no_grad():
+            
+            ### From 'data' to latent space
+            for batch in self.test_dataloader:
+                inputs, conditions, weights = batch
+                inputs = inputs.to(self.device)
+                conditions = conditions.to(self.device)
+                weights = weights.to(self.device)
+
+                # Transform the data to the latent space
+                latent = self.flow(conditions).transform(inputs)
+
+                conditions = torch.cat([conditions[:,:-1], torch.ones_like(conditions[:,-1]).view(-1,1)], dim = 1)
+
+                # Store the transformed data
+                if 'latent_data' not in locals():
+                    latent_data = latent
+                    conditions_data = conditions
+                    weights_data = weights
+                else:
+                    latent_data = torch.cat((latent_data, latent), dim=0)
+                    conditions_data = torch.cat((conditions_data, conditions), dim=0)
+                    weights_data = torch.cat((weights_data, weights), dim=0)
+
+            #########################################################
+            ##### from latent space to 'data'
+            
+            ## now lets create the latent dataset and dataloader
+            latent_dataset = torch.utils.data.TensorDataset(latent_data, conditions_data, weights_data)
+            latent_dataloader = torch.utils.data.DataLoader(latent_dataset, batch_size=8128)
+            
+            for batch in latent_dataloader:
+                inputs, conditions, weights = batch
+                inputs = inputs.to(self.device)
+                conditions = conditions.to(self.device)
+                weights = weights.to(self.device)
+
+                # Transform the data to the data space
+                flow_latent = self.flow(conditions).transform
+                sim_latent  = flow_latent.inv(inputs)
+
+                # Store the transformed data
+                if 'sim_data' not in locals():
+                    sim_data = sim_latent
+                    conditions_sim = conditions
+                    weights_sim = weights
+                else:
+                    sim_data = torch.cat((sim_data, sim_latent), dim=0)
+                    conditions_sim = torch.cat((conditions_sim, conditions), dim=0)
+                    weights_sim = torch.cat((weights_sim, weights), dim=0)
+            
+            self.samples = sim_data
+            #self.mc_test_conditions = conditions_sim
+
+            np.save( os.getcwd() + '/results/' +self.configuration + '/' +  'input_means.npy', self.input_mean_for_std.cpu())
+            np.save( os.getcwd() + '/results/' +self.configuration + '/' +  'input_std.npy'  , self.input_std_for_std.cpu() )
+
+            np.save( os.getcwd() + '/results/' +self.configuration + '/' +  'conditions_means.npy', self.condition_mean_for_std.cpu())
+            np.save( os.getcwd() + '/results/' +self.configuration + '/'  +  'conditions_std.npy' , self.condition_std_for_std.cpu() )
+
+            # now, lets invert the transformations
+            self.invert_transformation()
+
+            # Now I am brining the tensors back to cpu for plotting porpuses
+            self.validation_inputs       = self.validation_inputs.to('cpu')
+            self.data_validation_inputs  = self.data_validation_inputs .to('cpu')
+            self.validation_weights      = self.validation_weights.to('cpu')
+            self.samples                 = self.samples.to('cpu') 
+            self.mc_test_inputs          = self.mc_test_inputs.to('cpu')
+            self.mc_test_inputs          = self.mc_test_inputs.to('cpu')
+
+            # I guess I should use the mc_validation tensor instead of this -> self.validation_inputs
+            plot_utils.plot_distributions_for_tensors( np.array(self.data_test_inputs) , np.array(self.mc_test_inputs), np.array(self.samples), np.array(self.mc_test_weights.to('cpu')), self.dump_folder, self.variables_list )
+
+        return 0
+
+    # this function will be responsable to perform the transformations in data
+    def perform_transformation(self):
+
+        # Lets now apply the Isolation transformation into the isolation variables
+        # This "self.indexes_for_iso_transform" are the indexes of the variables in the inputs= tensors where the isolation variables are stored and thus, where the transformations will be performed
+        self.vector_for_iso_constructors_mc   = []
+        self.vector_for_iso_constructors_data = []
+        
+        # Performing the transformations of the non-continious variables
+        if len(self.indexes_for_iso_transform) > 0:
+            
+            # Creating the constructors
+            for index, shift_values in zip(self.indexes_for_iso_transform, self.Iso_transform_shift):
+                
+                self.vector_for_iso_constructors_data.append( Make_iso_continuous(self.data_training_inputs[:,index], torch.device('cpu') , shift = shift_values) )
+                self.vector_for_iso_constructors_mc.append( Make_iso_continuous(self.mc_training_inputs[:,index], torch.device('cpu')  , shift= shift_values) )
+                
+            # Now really applying the transformations
+            counter = 0
+            for index in self.indexes_for_iso_transform:
+                
+                # transforming the training dataset 
+                self.data_training_inputs[:,index] = self.vector_for_iso_constructors_data[counter].shift_and_sample(self.data_training_inputs[:,index])
+                self.mc_training_inputs[:,index] = self.vector_for_iso_constructors_mc[counter].shift_and_sample(self.mc_training_inputs[:,index])
+
+                # transforming the validation dataset
+                self.data_validation_inputs[:,index] = self.vector_for_iso_constructors_data[counter].shift_and_sample(self.data_validation_inputs[:,index])
+                self.mc_validation_inputs[:,index] = self.vector_for_iso_constructors_mc[counter].shift_and_sample(self.mc_validation_inputs[:,index])
+
+                # for the test dataset, we only have to transform the mc part
+                self.mc_test_inputs[:,index] = self.vector_for_iso_constructors_mc[counter].shift_and_sample(self.mc_test_inputs[:,index])
+
+                counter = counter + 1
+
+        # we fuse the data and mc tensors together, so they are trainied with both events
+        self.training_inputs       = torch.cat([ self.data_training_inputs, self.mc_training_inputs], axis = 0).float()
+        self.training_conditions   = torch.cat([ self.data_training_conditions, self.mc_training_conditions], axis = 0).float()
+        self.training_weights      = torch.tensor(np.concatenate([ self.data_training_weights, self.mc_training_weights], axis = 0)).float()
+
+        self.validation_inputs     = torch.cat([ self.data_validation_inputs, self.mc_validation_inputs], axis = 0).float()
+        self.validation_conditions = torch.cat([ self.data_validation_conditions, self.mc_validation_conditions], axis = 0).float()
+        self.validation_weights    = torch.tensor(np.concatenate([ self.data_validation_weights, self.mc_validation_weights], axis = 0)).float()
+
+        # We now perform the standartization of the training and validation arrays - lets use only mc to calculate the means and stuff ...
+        self.input_mean_for_std = torch.mean( self.training_inputs[  self.training_conditions[:,  self.training_conditions.size()[1] -1 ] == 0   ], 0 ).cpu()
+        self.input_std_for_std  = torch.std( self.training_inputs[  self.training_conditions[:,  self.training_conditions.size()[1] -1 ] == 0   ], 0 ).cpu()
+        
+        # the last element of the condition tensor is a boolean, so of couse we do not transform that xD
+        self.condition_mean_for_std = torch.mean( self.training_conditions[:,:-1][  self.training_conditions[:,  self.training_conditions.size()[1] -1 ] == 0   ], 0 ).cpu()
+        self.condition_std_for_std  = torch.std( self.training_conditions[:,:-1][  self.training_conditions[:,  self.training_conditions.size()[1] -1 ] == 0   ], 0 ).cpu()
+        
+        # transorming the training tensors
+        if( self.perform_std_transform ):
+            mean_inputs = self.input_mean_for_std
+            std_inputs = self.input_std_for_std
+            mean_conditions = self.condition_mean_for_std
+            std_conditions = self.condition_std_for_std
+
+            mean_inputs_training = mean_inputs.to(self.training_inputs.device)
+            std_inputs_training = std_inputs.to(self.training_inputs.device)
+            mean_conditions_training = mean_conditions.to(self.training_conditions.device)
+            std_conditions_training = std_conditions.to(self.training_conditions.device)
+
+            self.training_inputs = ( self.training_inputs - mean_inputs_training  )/std_inputs_training
+            self.training_conditions[:,:-1] = ( self.training_conditions[:,:-1] - mean_conditions_training )/std_conditions_training
+
+            mean_inputs_validation = mean_inputs.to(self.validation_inputs.device)
+            std_inputs_validation = std_inputs.to(self.validation_inputs.device)
+            mean_conditions_validation = mean_conditions.to(self.validation_conditions.device)
+            std_conditions_validation = std_conditions.to(self.validation_conditions.device)
+
+            self.validation_inputs = ( self.validation_inputs - mean_inputs_validation  )/std_inputs_validation
+            self.validation_conditions[:,:-1] = ( self.validation_conditions[:,:-1] - mean_conditions_validation  )/std_conditions_validation
+
+            mean_inputs_test = mean_inputs.to(self.mc_test_inputs.device)
+            std_inputs_test = std_inputs.to(self.mc_test_inputs.device)
+            mean_conditions_test = mean_conditions.to(self.mc_test_conditions.device)
+            std_conditions_test = std_conditions.to(self.mc_test_conditions.device)
+
+            self.mc_test_inputs = ( self.mc_test_inputs - mean_inputs_test  )/std_inputs_test
+            self.mc_test_conditions[:,:-1] = ( self.mc_test_conditions[:,:-1] - mean_conditions_test  )/std_conditions_test
+
+        #self.max_values = self.training_inputs[  self.training_conditions[:,  self.training_conditions.size()[1] -1 ] == 0   ][:,self.indexes_for_iso_transform].max(dim=0).values
+        #self.min_values = self.training_inputs[  self.training_conditions[:,  self.training_conditions.size()[1] -1 ] == 0   ][:,self.indexes_for_iso_transform].min(dim=0).values
+        
+        # Lets now plot the distirbutions after the transformations
+        print( "Ploting the validation of the transformations!!! " )
+        plot_utils.plot_distributions_after_transformations(self.variables_list ,self.training_inputs.clone().detach().cpu(), self.conditions_list ,self.training_conditions.clone().detach().cpu(), self.training_weights.clone().detach().cpu(), output_path = self.dump_folder + 'validation_plots/after_transformation/')
+        print( "End of the ploting the validaiton of the transformations!!! \n\n" )
+
+    # this function will be responsable to perform the inverse transformations in data
+    def invert_transformation(self):
+        
+        # Transforming the training tensors
+        if( self.perform_std_transform ):
+            #self.training_inputs = ( self.training_inputs*self.input_std_for_std + self.input_mean_for_std  )
+            #self.training_conditions[:,:-1] = ( self.training_conditions[:,:-1]*self.condition_std_for_std + self.condition_mean_for_std  )
+
+            # inverse transforming the validation tensors
+            input_std = self.input_std_for_std.to(self.validation_inputs.device)
+            input_mean = self.input_mean_for_std.to(self.validation_inputs.device)
+            condition_std = self.condition_std_for_std.to(self.validation_conditions.device)
+            condition_mean = self.condition_mean_for_std.to(self.validation_conditions.device)
+
+            self.validation_inputs = ( self.validation_inputs*input_std + input_mean  )
+            self.validation_conditions[:,:-1] = ( self.validation_conditions[:,:-1]*condition_std + condition_mean  )
+
+            input_std_test = self.input_std_for_std.to(self.mc_test_inputs.device)
+            input_mean_test = self.input_mean_for_std.to(self.mc_test_inputs.device)
+            condition_std_test = self.condition_std_for_std.to(self.mc_test_conditions.device)
+            condition_mean_test = self.condition_mean_for_std.to(self.mc_test_conditions.device)
+
+            # inverse transforming the test tensors
+            self.mc_test_inputs = ( self.mc_test_inputs*input_std_test + input_mean_test  )
+            self.mc_test_conditions[:,:-1] = ( self.mc_test_conditions[:,:-1]*condition_std_test + condition_mean_test  )
+
+            input_std_samples = self.input_std_for_std.to(self.samples.device)
+            input_mean_samples = self.input_mean_for_std.to(self.samples.device)
+            self.samples = ( self.samples*input_std_samples + input_mean_samples  )
+            
+        # Now inverting the isolation transformation
+        if len(self.indexes_for_iso_transform) > 0:
+        
+            counter = 0
+            for index in self.indexes_for_iso_transform:
+                
+                # for the test dataset, we only have to transform the mc part
+                self.mc_test_inputs[:,index] = self.vector_for_iso_constructors_mc[counter].inverse_shift_and_sample(self.mc_test_inputs[:,index], processed = True)
+
+                # now transforming the 
+                self.samples[:,index] = self.vector_for_iso_constructors_mc[counter].inverse_shift_and_sample(self.samples[:,index], processed = True)
+
+                counter = counter + 1
+
+        
+    # this funcitions is responable for reading the files processed and saved by the read_data.py files
+    # The tensors should already be ready for training, just plug and play!
+    def read_saved_tensor(self):
+
+        # this is defined in the read_data.py ...
+        path_to_save_tensors = os.path.abspath(self.tensor_path)
+
+        # reading the training tesnors
+        self.data_training_inputs      = torch.load( os.path.join(path_to_save_tensors, 'data_training_inputs.pt') )
+        self.data_training_conditions  = torch.load( os.path.join(path_to_save_tensors, 'data_training_conditions.pt') )
+        self.data_training_weights     = torch.load( os.path.join(path_to_save_tensors, 'data_training_weights.pt') ) 
+
+        self.mc_training_inputs        = torch.load( os.path.join(path_to_save_tensors, 'mc_training_inputs.pt') )
+        self.mc_training_conditions    = torch.load( os.path.join(path_to_save_tensors, 'mc_training_conditions.pt') )
+        self.mc_training_weights       = torch.load( os.path.join(path_to_save_tensors, 'mc_training_weights.pt') ) 
+
+        # now the validation tensors
+        self.data_validation_inputs     = torch.load( os.path.join(path_to_save_tensors, 'data_validation_inputs.pt') )
+        self.data_validation_conditions = torch.load( os.path.join(path_to_save_tensors, 'data_validation_conditions.pt') )
+        self.data_validation_weights    = torch.load( os.path.join(path_to_save_tensors, 'data_validation_weights.pt') ) 
+
+        self.mc_validation_inputs       = torch.load( os.path.join(path_to_save_tensors, 'mc_validation_inputs.pt') )
+        self.mc_validation_conditions   = torch.load( os.path.join(path_to_save_tensors, 'mc_validation_conditions.pt') )
+        self.mc_validation_weights      = torch.load( os.path.join(path_to_save_tensors, 'mc_validation_weights.pt') ) 
+
+        # now the test tensors
+        self.data_test_inputs           = torch.load( os.path.join(path_to_save_tensors, 'data_test_inputs.pt') )
+        self.data_test_conditions       = torch.load( os.path.join(path_to_save_tensors, 'data_test_conditions.pt') )
+        self.data_test_weights          = torch.load( os.path.join(path_to_save_tensors, 'data_test_weights.pt') ) 
+
+        self.mc_test_inputs             = torch.load( os.path.join(path_to_save_tensors, 'mc_test_inputs.pt') ).clone().detach()
+        self.mc_test_conditions         = torch.load( os.path.join(path_to_save_tensors, 'mc_test_conditions.pt') ).clone().detach()
+        self.mc_test_weights            = torch.load( os.path.join(path_to_save_tensors, 'mc_test_weights.pt') ).clone().detach()
+
+
+# This class is responsible for the transformation of isolation variables
+class Make_iso_continuous:
+    def __init__(self, tensor, device, shift=None):
+
+        self.device = device
+        self.shift = shift if shift is not None else 0.05
+
+        # Clone the tensor to avoid modifying the original data
+        self.before_transform = tensor.clone().detach()
+
+        # Masks to identify zero and non-zero elements
+        self.iso_bigger_zero = tensor > 0
+        self.iso_equal_zero = tensor == 0
+
+        # Store the number of zero elements
+        self.n_zero_events = torch.sum(self.iso_equal_zero)
+
+        # Initialize lowest_iso_value (used in the inverse transformation)
+        self.lowest_iso_value = 0.0
+
+        # Placeholder for min and max values after log transform (used in inverse scaling)
+        self.tensor_min = None
+        self.tensor_max = None
+
+    def shift_and_sample(self, tensor):
+  
+        # Ensure the tensor is on the correct device
+        tensor = tensor.to(self.device)
+
+        # Masks to identify zero and non-zero elements
+        bigger_than_zero = tensor > 0
+        tensor_zero = tensor == 0
+
+        # For non-zero elements, shift the values
+        tensor[bigger_than_zero] = tensor[bigger_than_zero] + self.shift - self.lowest_iso_value
+
+        # For zero elements, sample from a triangular distribution between 0 and self.shift * 0.98
+        if tensor_zero.any():
+            count = tensor_zero.sum().item()
+            samples = self.shift * 0.99 * torch.sqrt(
+                torch.rand(count, device=self.device, dtype=tensor.dtype)
+            )
+            tensor[tensor_zero] = samples
+
+        # Apply a small epsilon to avoid log(0)
+        epsilon = 1e-3
+
+        # Apply log transform to stretch the distribution
+        tensor = torch.log(epsilon + tensor)
+
+        return tensor
+
+    def inverse_shift_and_sample(self, tensor, processed=False):
+
+        # Ensure the tensor is on the correct device
+        tensor = tensor.to(self.device)
+
+        # Reverse the log transform
+        tensor = torch.exp(tensor) - 1e-3
+
+        # Masks to identify values after inverse log transform
+        bigger_than_shift = tensor >= self.shift
+        lower_than_shift = tensor < self.shift
+
+        # For values less than the shift, set them to zero
+        tensor[lower_than_shift] = 0.0
+
+        # For values greater than or equal to the shift, reverse the shift operation
+        tensor[bigger_than_shift] = tensor[bigger_than_shift] - self.shift + self.lowest_iso_value
+
+        # Ensure the inverse transformation recovers the original tensor
+        if not processed:
+            difference = torch.abs(self.before_transform - tensor)
+            max_difference = difference.max()
+            tolerance = 1e-5  # Adjust tolerance as needed
+            assert max_difference < tolerance, f"Max difference {max_difference} exceeds tolerance {tolerance}"
+
+        return tensor

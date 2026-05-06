@@ -1,0 +1,23 @@
+name: flow_corrections_clean_env
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch=2.1
+  - numpy
+  - scipy
+  - pandas
+  - pyyaml
+  - pyarrow
+  - matplotlib
+  - scikit-learn
+  - xgboost
+  - mplhep
+  - awkward
+  - hist
+  - iminuit
+  - hep_ml
+  - tqdm
+  - pip
+  - pip:
+      - zuko==1.0.1

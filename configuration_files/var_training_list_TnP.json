@@ -1,0 +1,56 @@
+{
+    "var_list": [
+        "probe_r9",
+        "probe_sieie",
+        "probe_etaWidth",
+        "probe_phiWidth",
+        "probe_sieip",
+        "probe_s4",
+        "probe_hoe",
+        "probe_ecalPFClusterIso",
+        "probe_trkSumPtHollowConeDR03",
+        "probe_trkSumPtSolidConeDR04",
+        "probe_pfChargedIso",
+        "probe_pfChargedIsoWorstVtx",
+        "probe_esEffSigmaRR",
+        "probe_esEnergyOverRawE",
+        "probe_hcalPFClusterIso",
+        "probe_energyErr"
+    ],
+    "conditions_list": [
+        "probe_pt",
+        "probe_ScEta",
+        "probe_phi",
+        "fixedGridRhoAll"
+    ],
+    "random_seed": 1337,
+    "variables_kinematic_rw": [
+        "probe_pt",
+        "probe_ScEta",
+        "probe_phi",
+        "fixedGridRhoAll"
+    ],
+    "train_val_test_split": [0.7, 0.1, 0.2],
+    "weight_var_name": "weight",
+    "number_of_bins_rw": 30,
+    "data_files": [
+        "/Users/yush/OneFlow/TnP/DataE_2022/nominal/*.parquet" ,
+        "/Users/yush/OneFlow/TnP/DataG_2022/nominal/*.parquet" ,
+        "/Users/yush/OneFlow/TnP/DataF_2022/nominal/*.parquet" 
+    ],
+    "MC_files": [
+        "/Users/yush/OneFlow/TnP/DY_postEE_2022/nominal/*.parquet"
+    ],
+    "MC_files_normalization": [
+        27.24
+    ],
+    "max_read_datafiles": 2000,
+    "max_read_mcfiles": 200,
+    "Index_for_Iso_transform":  [
+        6,7,8,9,10,11,12,13,14
+    ],
+    "Iso_transform_shift": [
+        0.02, 0.2 , 0.2 , 0.2, 0.2, 0.2, 0.2, 0.2, 0.2
+    ],
+    "selection_module": "selections.zee"
+}
